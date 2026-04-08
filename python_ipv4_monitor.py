@@ -11,8 +11,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 try:
     import objc  # type: ignore
@@ -51,10 +49,12 @@ else:
 
 
 ENDPOINTS = [
-    "https://api.ipify.org",
+    "https://ping0.cc/ip",
     "https://ifconfig.me/ip",
     "https://ipv4.icanhazip.com",
     "https://ipinfo.io/ip",
+    "https://api.ipify.org",
+    "https://browserleaks.com/ip",
 ]
 
 VPN_PREFIXES = ("utun", "ppp", "ipsec", "wg", "tun", "tap")
@@ -116,35 +116,41 @@ def extract_ipv4(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def fetch_public_ipv4(endpoints: list[str], interface: Optional[str], timeout: float) -> tuple[str, str]:
+def fetch_public_ipv4(
+    endpoints: list[str],
+    interface: Optional[str],
+    timeout: float,
+    *,
+    force_direct: bool = False,
+    proxy_url: Optional[str] = None,
+) -> tuple[str, str]:
     errors: list[str] = []
 
     for endpoint in endpoints:
         try:
+            cmd = [
+                "/usr/bin/curl",
+                "-4",
+                "-sS",
+                "--max-time",
+                str(max(1, int(round(timeout)))),
+                "-A",
+                "mac-ipv4-monitor/3.0",
+            ]
+            if force_direct:
+                cmd.extend(["--noproxy", "*"])
+            if proxy_url:
+                cmd.extend(["--proxy", proxy_url])
             if interface:
-                output = run_command(
-                    [
-                        "/usr/bin/curl",
-                        "-4",
-                        "-sS",
-                        "--max-time",
-                        str(max(1, int(round(timeout)))),
-                        "--interface",
-                        interface,
-                        endpoint,
-                    ],
-                    timeout=timeout + 1,
-                )
-            else:
-                req = Request(endpoint, headers={"User-Agent": "mac-ipv4-monitor/3.0"})
-                with urlopen(req, timeout=timeout) as resp:
-                    output = resp.read().decode("utf-8", errors="ignore")
+                cmd.extend(["--interface", interface])
+            cmd.append(endpoint)
+            output = run_command(cmd, timeout=timeout + 1)
 
             value = extract_ipv4(output)
             if value:
                 return value, endpoint
             errors.append(f"{endpoint}: no ipv4 in response")
-        except (URLError, HTTPError, TimeoutError, RuntimeError) as exc:
+        except (TimeoutError, RuntimeError) as exc:
             errors.append(f"{endpoint}: {exc}")
 
     raise RuntimeError("; ".join(errors) if errors else "all endpoints failed")
@@ -184,6 +190,77 @@ def get_default_route_interface() -> Optional[str]:
     return None
 
 
+def get_system_interfaces() -> list[str]:
+    try:
+        output = run_command(["/sbin/ifconfig", "-l"], timeout=1.8)
+    except RuntimeError:
+        return []
+    return [name.strip() for name in output.split() if name.strip()]
+
+
+def has_connected_vpn_service() -> bool:
+    try:
+        output = run_command(["/usr/sbin/scutil", "--nc", "list"], timeout=1.8)
+    except RuntimeError:
+        return False
+
+    for line in output.splitlines():
+        line = line.strip()
+        if "[VPN:" in line and "(Connected)" in line:
+            return True
+    return False
+
+
+def get_system_proxy_mapping() -> dict[str, str]:
+    try:
+        output = run_command(["/usr/sbin/scutil", "--proxy"], timeout=1.8)
+    except RuntimeError:
+        return {}
+
+    mapping: dict[str, str] = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if ":" not in line or line.startswith("<"):
+            continue
+        key, value = line.split(":", 1)
+        mapping[key.strip()] = value.strip()
+    return mapping
+
+
+def get_vpn_proxy_url() -> Optional[str]:
+    proxy = get_system_proxy_mapping()
+
+    if proxy.get("SOCKSEnable") == "1":
+        host = proxy.get("SOCKSProxy")
+        port = proxy.get("SOCKSPort")
+        if host and port:
+            return f"socks5h://{host}:{port}"
+
+    if proxy.get("HTTPSEnable") == "1":
+        host = proxy.get("HTTPSProxy")
+        port = proxy.get("HTTPSPort")
+        if host and port:
+            return f"http://{host}:{port}"
+
+    if proxy.get("HTTPEnable") == "1":
+        host = proxy.get("HTTPProxy")
+        port = proxy.get("HTTPPort")
+        if host and port:
+            return f"http://{host}:{port}"
+
+    return None
+
+
+def vpn_interface_rank(name: str) -> tuple[int, int]:
+    low = name.lower()
+    if low.startswith("utun"):
+        suffix = low[4:]
+        idx = int(suffix) if suffix.isdigit() else -1
+        # Prefer higher utun index first (usually latest active tunnel).
+        return (1, -idx)
+    return (0, 0)
+
+
 def is_vpn_interface(name: str) -> bool:
     low = name.lower()
     return any(low.startswith(prefix) for prefix in VPN_PREFIXES)
@@ -204,22 +281,82 @@ class NetworkMonitor:
         now = time.time()
 
         active_interfaces = get_active_interfaces()
+        system_interfaces = get_system_interfaces()
         default_interface = get_default_route_interface()
+        vpn_service_connected = has_connected_vpn_service()
+        vpn_proxy_url = get_vpn_proxy_url()
+        vpn_interfaces = [name for name in active_interfaces if is_vpn_interface(name)]
         physical = [name for name in active_interfaces if is_physical_interface(name)]
 
         vpn_active = False
         if default_interface and is_vpn_interface(default_interface):
             vpn_active = True
-        if any(is_vpn_interface(name) for name in active_interfaces):
+        if vpn_interfaces:
+            vpn_active = True
+        if vpn_service_connected:
+            vpn_active = True
+        if vpn_proxy_url:
+            # Proxy-based VPN clients may not alter default route.
             vpn_active = True
 
         notes: list[str] = []
 
         vpn_ipv4: Optional[str] = None
-        try:
-            vpn_ipv4, _ = fetch_public_ipv4(self.endpoints, interface=None, timeout=self.timeout)
-        except RuntimeError as exc:
-            notes.append(f"vpn probe: {exc}")
+        vpn_candidates: list[str] = []
+        for name in vpn_interfaces:
+            if name not in vpn_candidates:
+                vpn_candidates.append(name)
+
+        # Some VPN clients do not expose tunnel interfaces in scutil --nwi.
+        # Only probe ifconfig tunnel interfaces when VPN appears connected.
+        if vpn_active:
+            system_vpn = [name for name in system_interfaces if is_vpn_interface(name)]
+            system_vpn.sort(key=vpn_interface_rank)
+            for name in system_vpn:
+                if len(vpn_candidates) >= 3:
+                    break
+                if name not in vpn_candidates:
+                    vpn_candidates.append(name)
+
+        if default_interface and is_vpn_interface(default_interface) and default_interface not in vpn_candidates:
+            vpn_candidates.insert(0, default_interface)
+
+        for iface in vpn_candidates:
+            try:
+                vpn_ipv4, _ = fetch_public_ipv4(
+                    self.endpoints,
+                    interface=iface,
+                    timeout=self.timeout,
+                    force_direct=True,
+                )
+                notes.append(f"vpn via {iface}")
+                break
+            except RuntimeError as exc:
+                notes.append(f"[vpn:{iface}] {exc}")
+
+        if not vpn_ipv4 and vpn_proxy_url:
+            try:
+                vpn_ipv4, _ = fetch_public_ipv4(
+                    self.endpoints,
+                    interface=None,
+                    timeout=self.timeout,
+                    proxy_url=vpn_proxy_url,
+                )
+                notes.append("vpn via system-proxy")
+            except RuntimeError as exc:
+                notes.append(f"[vpn:proxy] {exc}")
+
+        if not vpn_ipv4:
+            try:
+                vpn_ipv4, _ = fetch_public_ipv4(
+                    self.endpoints,
+                    interface=None,
+                    timeout=self.timeout,
+                    force_direct=True,
+                )
+                notes.append("vpn via default-route")
+            except RuntimeError as exc:
+                notes.append(f"vpn probe: {exc}")
 
         direct_ipv4: Optional[str] = None
 
@@ -229,7 +366,12 @@ class NetworkMonitor:
 
         for iface in candidate_interfaces:
             try:
-                direct_ipv4, _ = fetch_public_ipv4(self.endpoints, interface=iface, timeout=self.timeout)
+                direct_ipv4, _ = fetch_public_ipv4(
+                    self.endpoints,
+                    interface=iface,
+                    timeout=self.timeout,
+                    force_direct=True,
+                )
                 break
             except RuntimeError as exc:
                 notes.append(f"[{iface}] {exc}")
